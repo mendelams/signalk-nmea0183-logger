@@ -1,6 +1,6 @@
 {
     "name": "signalk-nmea0183-logger",
-    "version": "2.2.0",
+    "version": "2.3.0",
     "description": "Signal K NMEA0183 logger with OpenSeaMap track, voyage stats, TWA, position-based weather",
     "main": "index.js",
     "keywords": [
@@ -14,5 +14,13 @@
     "author": "OpenPlotter User",
     "license": "MIT",
     "signalk-plugin-enabled-by-default": false
+    "repository": {
+      "type": "git",
+      "url": "https://github.com/mendelams/signalk-nmea0183-logger.git"
+    },
+    "bugs": {
+      "url": "https://github.com/mendelams/signalk-nmea0183-logger/issues"
+    },
+    "author": "mendelams",
   }
   
