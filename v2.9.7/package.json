@@ -18,7 +18,7 @@
   "signalk-plugin-enabled-by-default": false,
   "repository": {
     "type": "git",
-    "url": "https://github.com/TinkerSailor/signalk-nmea0183-logger"
+    "url": "https://github.com/mendelams/signalk-nmea0183-logger"
   },
   "files": [
     "index.js",
