@@ -1,0 +1,26 @@
+{
+  "name": "signalk-nmea0183-logger",
+  "version": "2.6.0",
+  "description": "NMEA0183 sentence logger with GPS track on OpenSeaMap, voyage statistics, AIS throttling, and weather overlay",
+  "main": "index.js",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-webapp",
+    "signalk-category-nmea-0183",
+    "signalk-category-ais",
+    "signalk-category-utility"
+  ],
+  "signalk-plugin-enabled-by-default": false,
+  "signalk": {
+    "displayName": "NMEA0183 Logger"
+  },
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "bugs": {
+    "url": ""
+  },
+  "author": "",
+  "license": "MIT"
+}

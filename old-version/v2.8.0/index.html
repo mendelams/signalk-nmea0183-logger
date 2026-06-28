@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NMEA0183 Logger</title>
+<style>
+body{font-family:-apple-system,sans-serif;background:#1a1d23;color:#e0e0e0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{text-align:center;padding:30px}
+h2{color:#4fc3f7;margin-bottom:8px}
+p{color:#888;font-size:.9em}
+a{color:#4fc3f7}
+</style>
+<script>
+// Redirect to the public API server on port 3033 (no auth needed)
+window.location.replace('http://' + window.location.hostname + ':3033/');
+</script>
+</head>
+<body>
+<div class="box">
+<h2>NMEA0183 Logger</h2>
+<p>Doorsturen naar <a id="link"></a>…</p>
+<script>
+var url = 'http://' + window.location.hostname + ':3033/';
+var a = document.getElementById('link');
+a.href = url; a.textContent = url;
+</script>
+</div>
+</body>
+</html>

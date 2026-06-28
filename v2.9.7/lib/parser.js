@@ -1,0 +1,1128 @@
+'use strict';
+const fs = require('fs');
+const zlib = require('zlib');
+const readline = require('readline');
+const { promisify } = require('util');
+const { SmoothedChangeDetector, StateToggleDetector, LevelCrossingDetector } = require('./events');
+const { validateChecksum } = require('./checksum');
+const { TRACK_MAX_POINTS } = require('./constants');
+
+const gunzip = promisify(zlib.gunzip);
+
+// ── Parsing helpers ──────────────────────────────────────────────
+
+/** Safe array max — avoids stack overflow on large arrays (>10k elements). */
+function arrMax(a) { let m = -Infinity; for (let i = 0; i < a.length; i++) if (a[i] > m) m = a[i]; return m; }
+/** Safe array min — avoids stack overflow on large arrays (>10k elements). */
+function arrMin(a) { let m = Infinity;  for (let i = 0; i < a.length; i++) if (a[i] < m) m = a[i]; return m; }
+
+/**
+ * Parse NMEA lat/lon fields to decimal degrees.
+ * @param {string} latS - Latitude string (DDMM.MMMM)
+ * @param {string} latD - N or S
+ * @param {string} lonS - Longitude string (DDDMM.MMMM)
+ * @param {string} lonD - E or W
+ * @returns {{lat:number, lon:number}|null}
+ */
+function parseLatLon(latS, latD, lonS, lonD) {
+  if (!latS || !lonS || !latD || !lonD) return null;
+  let lat = parseInt(latS.substring(0, 2), 10) + parseFloat(latS.substring(2)) / 60;
+  if (latD === 'S') lat = -lat;
+  let lon = parseInt(lonS.substring(0, 3), 10) + parseFloat(lonS.substring(3)) / 60;
+  if (lonD === 'W') lon = -lon;
+  if (isNaN(lat) || isNaN(lon) || (lat === 0 && lon === 0) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  return { lat, lon };
+}
+
+/**
+ * Parse NMEA time (HHMMSS) and date (DDMMYY) to Date object.
+ * @param {string} tm - Time string (HHMMSS or HHMMSS.SS)
+ * @param {string} d - Date string (DDMMYY)
+ * @returns {Date|null}
+ */
+function parseDateTime(tm, d) {
+  if (!tm || tm.length < 6) return null;
+  if (d && d.length >= 6) {
+    let yy = parseInt(d.substring(4, 6), 10);
+    yy = yy < 80 ? 2000 + yy : 1900 + yy;
+    return new Date(Date.UTC(yy, parseInt(d.substring(2, 4), 10) - 1, parseInt(d.substring(0, 2), 10),
+      parseInt(tm.substring(0, 2), 10), parseInt(tm.substring(2, 4), 10), parseInt(tm.substring(4, 6), 10)));
+  }
+  return null;
+}
+
+/** Haversine distance in nautical miles between two lat/lon points. */
+function haversineNm(a, b, c, d) {
+  const R = 3440.065, dL = (c - a) * Math.PI / 180, dO = (d - b) * Math.PI / 180;
+  const x = Math.sin(dL / 2) ** 2 + Math.cos(a * Math.PI / 180) * Math.cos(c * Math.PI / 180) * Math.sin(dO / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+
+function strip(f) {
+  if (!f) return '';
+  const i = f.indexOf('*');
+  return i >= 0 ? f.substring(0, i) : f;
+}
+
+function r2(v) { return v !== null && v !== undefined ? Math.round(v * 100) / 100 : null; }
+function r1(v) { return v !== null && v !== undefined ? Math.round(v * 10) / 10 : null; }
+function r0(v) { return v !== null && v !== undefined ? Math.round(v) : null; }
+
+// ── AIS 6-bit decoder ────────────────────────────────────────────
+
+/**
+ * Decode AIS 6-bit armored payload to position data.
+ * Supports message types 1, 2, 3 (Class A) and 18 (Class B).
+ * @param {string} payload - AIS 6-bit encoded payload
+ * @returns {{mmsi:string, lat:number, lon:number, sog:number|null, cog:number|null}|null}
+ */
+function parseAISPosition(payload) {
+  if (!payload || payload.length < 20) return null;
+  const bits = [];
+  for (let i = 0; i < payload.length; i++) {
+    let c = payload.charCodeAt(i) - 48;
+    if (c > 40) c -= 8;
+    for (let b = 5; b >= 0; b--) bits.push((c >> b) & 1);
+  }
+  function bitsToUint(arr, start, len) {
+    let v = 0; for (let i = start; i < start + len; i++) v = v * 2 + (arr[i] || 0); return v;
+  }
+  function bitsToInt(arr, start, len) {
+    let v = bitsToUint(arr, start, len);
+    if (v >= (1 << (len - 1))) v -= (1 << len);
+    return v;
+  }
+  const msgType = bitsToUint(bits, 0, 6);
+  if ((msgType === 1 || msgType === 2 || msgType === 3) && bits.length >= 168) {
+    const mmsi = bitsToUint(bits, 8, 30);
+    const sog = bitsToUint(bits, 50, 10) / 10;
+    const lon = bitsToInt(bits, 61, 28) / 600000;
+    const lat = bitsToInt(bits, 89, 27) / 600000;
+    const cog = bitsToUint(bits, 116, 12) / 10;
+    if (mmsi === 0 || Math.abs(lat) > 90 || Math.abs(lon) > 180 || lat === 91 || lon === 181) return null;
+    return { mmsi: String(mmsi), lat, lon, sog: sog < 102.3 ? sog : null, cog: cog < 360 ? cog : null };
+  }
+  if (msgType === 18 && bits.length >= 168) {
+    const mmsi = bitsToUint(bits, 8, 30);
+    const sog = bitsToUint(bits, 46, 10) / 10;
+    const lon = bitsToInt(bits, 57, 28) / 600000;
+    const lat = bitsToInt(bits, 85, 27) / 600000;
+    const cog = bitsToUint(bits, 112, 12) / 10;
+    if (mmsi === 0 || Math.abs(lat) > 90 || Math.abs(lon) > 180 || lat === 91 || lon === 181) return null;
+    return { mmsi: String(mmsi), lat, lon, sog: sog < 102.3 ? sog : null, cog: cog < 360 ? cog : null };
+  }
+  return null;
+}
+
+// ── Event detectors ──────────────────────────────────────────────
+
+function createDetectors(config, t) {
+  const det = {};
+
+  if (config.evCourseEnabled !== false) {
+    det.course = new SmoothedChangeDetector({
+      type: 'course', threshold: config.evCourseDeg || 30,
+      bufferSize: 5, minElapsed: 10, circular: true, drift: 0.05,
+      format: (prev, curr, diff) =>
+        `${Math.round(prev)}° → ${Math.round(curr)}° (${diff > 0 ? '+' : ''}${Math.round(diff)}°)`
+    });
+  }
+
+  if (config.evWindEnabled !== false) {
+    det.wind = new SmoothedChangeDetector({
+      type: 'wind', threshold: config.evWindKn || 5,
+      bufferSize: 10, minElapsed: 10, circular: false, drift: 0.05,
+      format: (prev, curr, diff) =>
+        `TWS ${prev.toFixed(1)} → ${curr.toFixed(1)} kn (${diff > 0 ? '+' : ''}${diff.toFixed(1)})`
+    });
+  }
+
+  if (config.evEngineEnabled !== false) {
+    det.engine = new StateToggleDetector({
+      type: 'engine', threshold: config.evEngineRpmThreshold || 100,
+      debounceMs: 30000, trackDuration: true,
+      formatOn: () => t('engineStarted'),
+      formatOff: (_ts, dur) => t('engineStoppedDur', dur),
+      formatOffNoDur: () => t('engineStopped')
+    });
+  }
+
+  if (config.evBatteryEnabled !== false) {
+    det.battery = new LevelCrossingDetector({
+      type: 'battery', threshold: config.evBatteryLowV || 12.0, direction: 'below',
+      formatCross: (val, thr, id) =>
+        id ? t('batteryLowId', val.toFixed(1), thr, id) : t('batteryLow', val.toFixed(1), thr),
+      formatRecover: (val, id) =>
+        id ? t('batteryRecoverId', val.toFixed(1), id) : t('batteryRecover', val.toFixed(1))
+    });
+  }
+
+  return det;
+}
+
+// ── DSC lookup tables ────────────────────────────────────────────
+
+const DSC_CAT = { '00':'routine', '08':'safety', '10':'urgency', '12':'distress' };
+const DSC_NATURE = {
+  '00':'undesignated', '01':'fire', '02':'flooding', '03':'collision', '04':'grounding',
+  '05':'capsizing', '06':'sinking', '07':'disabled', '08':'undesignated', '09':'abandoning',
+  '10':'EPIRB', '11':'MOB', '12':'piracy'
+};
+
+// ── Main parser ──────────────────────────────────────────────────
+
+/**
+ * Parse an NMEA0183 log file into structured statistics.
+ * Handles both plain .log and .log.gz files. Validates checksums on all $ sentences.
+ * 
+ * @param {string} filepath - Path to log file (.log or .log.gz)
+ * @param {object} config - Plugin config (event thresholds, filters)
+ * @param {function} t - Translation function t(key, ...args)
+ * @param {object} [opts] - Options: {fullTrack: bool, includeAIS: bool}
+ * @returns {object} Stats object with track, events, wind, depth, engine, AIS, DSC, etc.
+ */
+function parseLogFile(filepath, config, t, opts) {
+  opts = opts || {};
+  const content = filepath.endsWith('.gz')
+    ? zlib.gunzipSync(fs.readFileSync(filepath)).toString('utf8')
+    : fs.readFileSync(filepath, 'utf8');
+  // Avoid filter(l => l.trim()) which creates 560k+ string objects.
+  // processLines handles empty lines via the charCode check on s[0].
+  const lines = content.split('\n');
+  return processLines(lines, config, t, opts);
+}
+
+/**
+ * Async variant of parseLogFile using streaming readline.
+ * Memory-efficient for large files; non-blocking on the event loop.
+ * Use this in HTTP handlers and any context where blocking matters.
+ *
+ * @param {string} filepath - Path to log file (.log or .log.gz)
+ * @param {object} config - Plugin config
+ * @param {function} t - Translation function
+ * @param {object} [opts] - {fullTrack: bool, includeAIS: bool}
+ * @returns {Promise<object>} Stats object (same shape as parseLogFile)
+ */
+async function parseLogFileAsync(filepath, config, t, opts) {
+  opts = opts || {};
+  const lines = [];
+  if (filepath.endsWith('.gz')) {
+    const buf = await fs.promises.readFile(filepath);
+    const decompressed = (await gunzip(buf)).toString('utf8');
+    // split without filter — processLines handles empty/invalid lines
+    return processLines(decompressed.split('\n'), config, t, opts);
+  } else {
+    // Streaming readline for plain .log: low memory, non-blocking
+    const stream = fs.createReadStream(filepath, { encoding: 'utf8', highWaterMark: 256 * 1024 });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of rl) {
+      lines.push(line);
+    }
+    return processLines(lines, config, t, opts);
+  }
+}
+
+/**
+ * Shared line-processing logic used by both sync and async parsers.
+ * Takes pre-split, trimmed lines and produces the stats object.
+ * @private
+ */
+function processLines(lines, config, t, opts) {
+  opts = opts || {};
+
+  // Tracking arrays and state
+  const track = [], sogV = [], twsV = [], twaV = [], rpmE = [];
+  // Timestamped series for charts.
+  // Collected during parsing; downsampled at end to SERIES_MAX points
+  // using stride-based selection to ensure uniform time coverage.
+  const sogRaw = [], twsRaw = [], awsRaw = [], twaRaw = [],
+        awaRaw = [], depthRaw = [], stwRaw = [];
+  const SERIES_MAX = 300;
+  const events = [];
+  let startTime = null, endTime = null, totalDist = 0, prevPos = null;
+  const intervalBuckets = {};
+
+  const det = createDetectors(config, t);
+  function emit(ev) { if (ev) events.push(ev); }
+
+  let gpsTotal = 0, gpsInvalid = 0;
+  let checksumFails = 0;
+  const sentenceTypeCounts = {};
+  const totalLines = lines.length;
+
+  const aisVessels = {};
+  const collectAIS = !!opts.includeAIS;
+
+  const depthV = [];
+  let shallowest = null, lastPos = null;
+
+  const hdgV = [], rsaV = [], xteV = [];
+  let apActive = false, apSegments = [];
+  let apCurrentStart = null, apCurrentMode = null;
+
+  // Apparent wind state — set by MWV ref=R, consumed by VHW for TWS calculation
+  let lastAwsKn = null, lastAwaDeg = null;
+
+  const dscCalls = [];
+
+  const currentV = [];
+  let lastCurrentTime = null, ahConsumed = 0;
+  const socV = [];
+
+  // Engine sensors (ESP32 monitor or similar): coolant temperature, fuel level, runtime hour meter
+  const engineTempV = [];   // °C samples (XDR ENGINE)
+  const fuelLevelV = [];    // % samples (XDR FUEL)
+  const runtimeV = [];      // hour-meter readings (XDR RUNTIME)
+
+  let lastKnownTs = null;    // last RMC Date, fallback for non-prefixed logs
+  let lastKnownTsStr = null; // same, as ISO string (avoids new Date().toISOString())
+
+  for (const line of lines) {
+    // ── Fast timestamp extraction ─────────────────────────────────────────
+    // ISO timestamp is always 24 chars (2026-06-23T15:46:29.154Z) followed by space.
+    // Using indexOf+slice is ~4× faster than running TS_RE on every line.
+    // We carry both the raw string (tsStr) for cheap series.push({t:tsStr})
+    // and a Date object (logTs) only when needed for arithmetic / detection.
+    let s, logTs, tsStr;
+    const sp = line.indexOf(' ');
+    if (sp >= 20 && sp <= 27 && line.charCodeAt(0) >= 48) {
+      tsStr = line.slice(0, sp);
+      s = line.slice(sp + 1);
+      // Defer Date construction — only create when actually needed below
+      logTs = null; // will be created lazily via getLogTs()
+    } else {
+      s = line.trim ? line.trim() : line;
+      tsStr = lastKnownTsStr;
+      logTs = lastKnownTs;
+    }
+
+    // Lazy Date getter — avoids creating 560k Date objects for sentences
+    // that only need the ISO string (series pushes)
+    let _logTsCreated = (sp < 20 || sp > 27); // already set if fallback
+    function getLogTs() {
+      if (!_logTsCreated) {
+        logTs = tsStr ? new Date(tsStr) : null;
+        _logTsCreated = true;
+      }
+      return logTs;
+    }
+
+    const c0 = s.charCodeAt(0);
+    if (c0 !== 36 && c0 !== 33) continue; // must start with '$' or '!'
+
+    // ── AIS vessel messages: optionally collect, otherwise skip early ─────
+    if (c0 === 33) {
+      const isVDO = s.charCodeAt(4) === 79; // '!AIVDO...'
+      if (!isVDO && !collectAIS) continue;
+    }
+
+    // ── Early skip by sentence type from raw chars (before checksum + split) ─
+    // Check chars 3-5 of the NMEA field to identify skippable types.
+    // Avoids calling validateChecksum and split() on ~90k skippable sentences.
+    if (c0 === 36 && s.length >= 6) {
+      const c3 = s.charCodeAt(3), c4 = s.charCodeAt(4), c5 = s.charCodeAt(5);
+      // GSV(71,83,86) GSA(71,83,65) GST(71,83,84) → all start G,S
+      if (c3 === 71 && c4 === 83) {
+        sentenceTypeCounts[s.substring(3,6)] = (sentenceTypeCounts[s.substring(3,6)]||0)+1;
+        continue;
+      }
+      // VTG(86,84,71)
+      if (c3 === 86 && c4 === 84 && c5 === 71) {
+        sentenceTypeCounts['VTG'] = (sentenceTypeCounts['VTG']||0)+1;
+        continue;
+      }
+      // TXT(84,88,84)
+      if (c3 === 84 && c4 === 88 && c5 === 84) {
+        sentenceTypeCounts['TXT'] = (sentenceTypeCounts['TXT']||0)+1;
+        continue;
+      }
+    }
+
+    // ── Inline checksum validation (avoids function call overhead on 370k sentences) ──
+    if (c0 === 36) {
+      const star = s.lastIndexOf('*');
+      if (star > 0 && star + 2 < s.length) {
+        let cs = 0;
+        for (let i = 1; i < star; i++) cs ^= s.charCodeAt(i);
+        const hi = s.charCodeAt(star+1), lo = s.charCodeAt(star+2);
+        const exp = ((hi >= 65 ? hi - 55 : hi - 48) << 4) | (lo >= 65 ? lo - 55 : lo - 48);
+        if (cs !== exp) { checksumFails++; continue; }
+      }
+    }
+
+    // ── HDG/HDM/HDT: fast extraction without split (139k sentences/day) ────
+    // $AIHDG,322.7,,,2.0,E*2C → heading is field 1 (between 1st and 2nd comma)
+    if (s.length >= 6) {
+      const c3 = s.charCodeAt(3), c4 = s.charCodeAt(4), c5 = s.charCodeAt(5);
+      if (c3 === 72 && c4 === 68 && (c5 === 71 || c5 === 77 || c5 === 84)) { // HDG/HDM/HDT
+        sentenceTypeCounts[s.substring(3,6)] = (sentenceTypeCounts[s.substring(3,6)]||0)+1;
+        const p1 = s.indexOf(',') + 1;
+        if (p1 > 0) {
+          const p2 = s.indexOf(',', p1);
+          const hdg = parseFloat(p2 > 0 ? s.slice(p1, p2) : s.slice(p1));
+          if (!isNaN(hdg) && hdg >= 0 && hdg < 360) hdgV.push(hdg);
+        }
+        continue; // handled — skip to next line
+      }
+    }
+
+    const f = s.split(',');
+    if (f.length < 2) continue;
+    const st = f[0].length >= 6 ? f[0].substring(3, 6) : f[0].substring(3);
+
+    const stKey = f[0] === '$SKAIS' ? 'SKAIS' : st;
+    sentenceTypeCounts[stKey] = (sentenceTypeCounts[stKey] || 0) + 1;
+
+    // ── RMC ──
+    if (st === 'RMC' && f.length >= 10) {
+      gpsTotal++;
+      if (f[2] !== 'A') { gpsInvalid++; continue; }
+      const pos = parseLatLon(f[3], f[4], f[5], f[6]);
+      const sog = parseFloat(f[7]);
+      const cog = parseFloat(f[8]);
+      const dt = parseDateTime(f[1], f[9]);
+      const ts = dt || getLogTs();
+      if (ts) {
+        lastKnownTs = ts;
+        lastKnownTsStr = ts.toISOString();
+        if (!startTime || ts < startTime) startTime = ts;
+        if (!endTime || ts > endTime) endTime = ts;
+      }
+      if (pos) {
+        const pt = { lat: pos.lat, lon: pos.lon, sog: isNaN(sog) ? null : sog, time: ts ? ts.toISOString() : null };
+        track.push(pt);
+        lastPos = pt;
+        if (!isNaN(sog)) {
+          sogV.push(sog);
+          if (ts) sogRaw.push({ t: ts.toISOString(), v: Math.round(sog * 10) / 10 });
+        }
+        if (prevPos) {
+          const d = haversineNm(prevPos.lat, prevPos.lon, pos.lat, pos.lon);
+          if (d < 10) totalDist += d;
+        }
+        prevPos = pos;
+        if (ts) {
+          const bucket = ts.getUTCHours();
+          if (!intervalBuckets[bucket]) intervalBuckets[bucket] = { latSum: 0, lonSum: 0, count: 0, twsValues: [], tempValues: [] };
+          intervalBuckets[bucket].latSum += pos.lat;
+          intervalBuckets[bucket].lonSum += pos.lon;
+          intervalBuckets[bucket].count++;
+        }
+        if (det.course && !isNaN(cog) && ts) emit(det.course.feed(cog, ts));
+      }
+    }
+
+    // ── GGA ──
+    if (st === 'GGA' && f.length >= 10) {
+      const fix = parseInt(f[6], 10);
+      if (fix > 0) {
+        gpsTotal++;
+        const pos = parseLatLon(f[2], f[3], f[4], f[5]);
+        if (pos) lastPos = { lat: pos.lat, lon: pos.lon, time: tsStr || null };
+      } else { gpsTotal++; gpsInvalid++; }
+    }
+
+    // ── MWV ──
+    if (st === 'MWV' && f.length >= 6) {
+      const angle = parseFloat(f[1]);
+      const ref = f[2];
+      const speed = parseFloat(f[3]);
+      const unit = f[4];
+      const status = strip(f[5] || '');
+      if (!isNaN(speed) && (status === 'A' || status === '')) {
+        let kn = speed;
+        if (unit === 'M') kn = speed * 1.94384;
+        else if (unit === 'K') kn = speed * 0.539957;
+        if (ref === 'T') {
+          // True wind directly reported
+          if (kn >= 0 && kn < 200) {
+            twsV.push(kn);
+            if (tsStr) {
+              const bucket = getLogTs().getUTCHours();
+              if (intervalBuckets[bucket]) intervalBuckets[bucket].twsValues.push(kn);
+              twsRaw.push({ t: tsStr, v: r1(kn) });
+            }
+            if (det.wind && tsStr) emit(det.wind.feed(kn, getLogTs()));
+          }
+          if (!isNaN(angle)) {
+            twaV.push(angle);
+            if (tsStr) twaRaw.push({ t: tsStr, v: Math.round(angle) });
+          }
+        } else if (ref === 'R') {
+          const signedAwa = !isNaN(angle) ? (angle > 180 ? angle - 360 : angle) : null;
+          lastAwsKn = kn;
+          lastAwaDeg = signedAwa !== null ? signedAwa : null;
+          if (tsStr) {
+            awsRaw.push({ t: tsStr, v: r1(kn) });
+          }
+        }
+      }
+    }
+
+    // ── VHW: water speed (and heading) — calculate TWS from apparent wind ──
+    if (st === 'VHW' && f.length >= 7) {
+      const stw = parseFloat(f[5]); // knots
+      if (!isNaN(stw) && stw >= 0 && stw < 50) {
+        if (tsStr) stwRaw.push({ t: tsStr, v: r1(stw) });
+      }
+      if (!isNaN(stw) && stw >= 0 && stw < 50 && lastAwsKn !== null && lastAwaDeg !== null) {
+        const awaRad = lastAwaDeg * Math.PI / 180;
+        const tws = Math.sqrt(
+          lastAwsKn * lastAwsKn + stw * stw - 2 * lastAwsKn * stw * Math.cos(awaRad)
+        );
+        if (tws >= 0 && tws < 200) {
+          twsV.push(tws);
+          if (tsStr) {
+            const bucket = getLogTs().getUTCHours();
+            if (intervalBuckets[bucket]) intervalBuckets[bucket].twsValues.push(tws);
+            twsRaw.push({ t: tsStr, v: r1(tws) });
+          }
+          if (det.wind && tsStr) emit(det.wind.feed(tws, getLogTs()));
+        }
+        if (tws > 0 && stw >= 0.5) {
+          const twa = Math.asin(Math.min(1, lastAwsKn * Math.sin(awaRad) / tws)) * 180 / Math.PI;
+          if (!isNaN(twa)) {
+            const signedTwa = lastAwaDeg < 0 ? -Math.abs(twa) : Math.abs(twa);
+            twaV.push(Math.abs(twa));
+            if (tsStr) twaRaw.push({ t: tsStr, v: Math.round(signedTwa) });
+          }
+        }
+        if (stw >= 0.5 && tsStr && lastAwaDeg !== null) {
+          awaRaw.push({ t: tsStr, v: Math.round(lastAwaDeg) });
+        }
+      }
+    }
+
+    // ── MWD ──
+    if (st === 'MWD' && f.length >= 6) {
+      const kn = parseFloat(f[5]);
+      if (!isNaN(kn) && kn >= 0 && kn < 200) twsV.push(kn);
+    }
+
+    // ── MTA ──
+    if (st === 'MTA' && f.length >= 3) {
+      const temp = parseFloat(f[1]);
+      const u = strip(f[2] || '');
+      if (!isNaN(temp) && tsStr) {
+        const tempC = (u === 'F') ? (temp - 32) * 5 / 9 : temp;
+        const bucket = getLogTs().getUTCHours();
+        if (intervalBuckets[bucket]) intervalBuckets[bucket].tempValues.push(tempC);
+      }
+    }
+
+    // ── MDA ──
+    if (st === 'MDA' && f.length >= 6) {
+      const temp = parseFloat(f[5]);
+      if (!isNaN(temp) && tsStr) {
+        const bucket = getLogTs().getUTCHours();
+        if (intervalBuckets[bucket]) intervalBuckets[bucket].tempValues.push(temp);
+      }
+    }
+
+    // ── RPM ──
+    if (st === 'RPM' && f.length >= 4) {
+      const rpm = parseFloat(f[3]), status = strip(f[5] || '');
+      if (!isNaN(rpm) && (status === 'A' || status === '')) {
+        const absRpm = Math.abs(rpm);
+        rpmE.push({ time: getLogTs(), rpm: absRpm });
+        if (det.engine && tsStr) emit(det.engine.feed(absRpm, getLogTs()));
+      }
+    }
+
+    // ── XDR: voltage, current, SOC, fuel, engine temp, runtime ──
+    if (st === 'XDR' && f.length >= 5) {
+      for (let xi = 1; xi + 3 < f.length; xi += 4) {
+        const xVal = parseFloat(f[xi + 1]);
+        const xUnit = f[xi + 2];
+        const xId = strip(f[xi + 3] || '').toUpperCase();
+        if (isNaN(xVal)) continue;
+        // ENGINE#0 — coolant temperature in °C (transducer type C)
+        if (xUnit === 'C' && xId.startsWith('ENGINE')) {
+          if (xVal > -50 && xVal < 200) engineTempV.push({ time: getLogTs(), v: xVal });
+        }
+        // FUEL#0 — fuel tank level as %, comes from V transducer with % unit
+        if (xUnit === '%' && xId.startsWith('FUEL')) {
+          if (xVal >= 0 && xVal <= 100) fuelLevelV.push({ time: getLogTs(), v: xVal });
+        }
+        // RUNTIME#0 — engine runtime hour meter reading
+        if (xUnit === 'h' && xId.startsWith('RUNTIME')) {
+          if (xVal >= 0 && xVal < 100000) runtimeV.push({ time: getLogTs(), v: xVal });
+        }
+        if (det.battery && xUnit === 'V' && xVal > 0 && xVal < 50 && xId !== 'FUEL') {
+          emit(det.battery.feed(xVal, getLogTs(), xId));
+        }
+        if (xUnit === 'A' && (xId === 'BATT' || xId === 'CHG')) {
+          const amps = xId === 'CHG' ? Math.abs(xVal) : -Math.abs(xVal);
+          currentV.push(amps);
+          if (lastCurrentTime && tsStr) {
+            const dtH = (getLogTs() - lastCurrentTime) / 3600000;
+            if (dtH > 0 && dtH < 1) ahConsumed += Math.abs(amps) * dtH;
+          }
+          lastCurrentTime = getLogTs();
+        }
+        if (xUnit === '%' && xId === 'SOC') {
+          socV.push(xVal);
+        }
+      }
+    }
+
+    // ── VDM: AIS vessel positions ──
+    if (collectAIS && st === 'VDM' && f.length >= 7) {
+      const fragCount = parseInt(f[1], 10);
+      const fragNum = parseInt(f[2], 10);
+      if (fragCount === 1 && fragNum === 1) {
+        const pos = parseAISPosition(f[5]);
+        if (pos) {
+          if (!aisVessels[pos.mmsi]) aisVessels[pos.mmsi] = [];
+          aisVessels[pos.mmsi].push({
+            lat: pos.lat, lon: pos.lon, time: tsStr || null,
+            sog: pos.sog, cog: pos.cog
+          });
+        }
+      }
+    }
+
+    // ── VDO: own-vessel AIS position (Class B) ──
+    // Used as fallback track source when RMC is absent but logTs is available.
+    // Class B transmits every 30s, giving coarser track resolution than RMC.
+    // Only used if:
+    //   (a) line has an ISO timestamp (logTs) — requires includeTimestamp: true
+    //   (b) no RMC fix received within the last vdoFallbackSec seconds
+    if ((st === 'VDM' ? false : st === 'VDO') && f.length >= 6 && tsStr) {
+      const VDO_FALLBACK_SEC = (config.vdoFallbackSec !== undefined ? config.vdoFallbackSec : 60) * 1000;
+      const lastRmcMs = lastPos && lastPos.time ? new Date(lastPos.time).getTime() : 0;
+      const gapMs = getLogTs().getTime() - lastRmcMs;
+      if (gapMs > VDO_FALLBACK_SEC) {
+        const fragCount = parseInt(f[1], 10);
+        const fragNum = parseInt(f[2], 10);
+        if (fragCount === 1 && fragNum === 1) {
+          const pos = parseAISPosition(f[5]);
+          // Only use if valid lat/lon and message type 18 (Class B position)
+          if (pos && Math.abs(pos.lat) < 90 && Math.abs(pos.lon) < 180 && pos.lat !== 0 && pos.lon !== 0) {
+            const sog = pos.sog !== null ? pos.sog : null;
+            const pt = {
+              lat: pos.lat, lon: pos.lon,
+              sog, time: tsStr,
+              src: 'vdo'  // mark as VDO-derived for diagnostics
+            };
+            track.push(pt);
+            lastPos = pt;
+            if (sog !== null && !isNaN(sog)) sogV.push(sog);
+            if (prevPos) {
+              const d = haversineNm(prevPos.lat, prevPos.lon, pos.lat, pos.lon);
+              if (d < 10) totalDist += d;
+            }
+            prevPos = pos;
+            if (!startTime || getLogTs() < startTime) startTime = getLogTs();
+            if (!endTime || getLogTs() > endTime) endTime = getLogTs();
+          }
+        }
+      }
+    }
+
+    // ── SKAIS: AIS via SignalK (NMEA2000 boats) ──
+    if (collectAIS && f[0] === '$SKAIS' && f.length >= 6) {
+      const mmsi = f[1];
+      const pos = parseLatLon(f[2], f[3], f[4], f[5]);
+      if (pos && mmsi) {
+        const sog = f.length >= 7 ? parseFloat(f[6]) : null;
+        const cog = f.length >= 8 ? parseFloat(strip(f[7] || '')) : null;
+        if (!aisVessels[mmsi]) aisVessels[mmsi] = [];
+        aisVessels[mmsi].push({
+          lat: pos.lat, lon: pos.lon, time: tsStr || null,
+          sog: !isNaN(sog) ? sog : null, cog: !isNaN(cog) ? cog : null
+        });
+      }
+    }
+
+    // ── DBT: Depth Below Transducer ──
+    if (st === 'DBT' && f.length >= 5) {
+      const dm = parseFloat(f[3]);
+      if (!isNaN(dm) && dm > 0 && dm < 9999) {
+        depthV.push(dm);
+        if (tsStr) depthRaw.push({ t: tsStr, v: r1(dm) });
+        if (!shallowest || dm < shallowest.depth) {
+          shallowest = { depth: dm, lat: lastPos ? lastPos.lat : null, lon: lastPos ? lastPos.lon : null, time: lastPos ? lastPos.time : (tsStr || null) };
+        }
+      }
+    }
+
+    // ── DBS: Depth Below Surface ──
+    if (st === 'DBS' && f.length >= 5) {
+      const dm = parseFloat(f[3]);
+      if (!isNaN(dm) && dm > 0 && dm < 9999) {
+        depthV.push(dm);
+        if (tsStr) depthRaw.push({ t: tsStr, v: r1(dm) });
+        if (!shallowest || dm < shallowest.depth) {
+          shallowest = { depth: dm, lat: lastPos ? lastPos.lat : null, lon: lastPos ? lastPos.lon : null, time: lastPos ? lastPos.time : (tsStr || null) };
+        }
+      }
+    }
+
+    // ── DPT: Depth ──
+    if (st === 'DPT' && f.length >= 2) {
+      const dm = parseFloat(f[1]);
+      const offset = f.length >= 3 ? parseFloat(f[2]) : 0;
+      const depth = !isNaN(dm) && dm > 0 ? dm + (isNaN(offset) ? 0 : offset) : NaN;
+      if (!isNaN(depth) && depth > 0 && depth < 9999) {
+        depthV.push(depth);
+        if (tsStr) depthRaw.push({ t: tsStr, v: r1(depth) });
+        if (!shallowest || depth < shallowest.depth) {
+          shallowest = { depth, lat: lastPos ? lastPos.lat : null, lon: lastPos ? lastPos.lon : null, time: lastPos ? lastPos.time : (tsStr || null) };
+        }
+      }
+    }
+
+    // ── HDG / HDM / HDT: Heading ──
+    // ── RSA: Rudder Sensor Angle ──
+    if (st === 'RSA' && f.length >= 3) {
+      const angle = parseFloat(f[1]);
+      const status = strip(f[2] || '');
+      if (!isNaN(angle) && (status === 'A' || status === '')) rsaV.push(angle);
+    }
+
+    // ── XTE: Cross-Track Error ──
+    if (st === 'XTE' && f.length >= 6) {
+      const status = f[1];
+      const xte = parseFloat(f[3]);
+      const dir = f[4];
+      if (status === 'A' && !isNaN(xte)) xteV.push(dir === 'L' ? -xte : xte);
+    }
+
+    // ── APB: Autopilot Sentence B ──
+    if (st === 'APB' && f.length >= 14) {
+      const status = f[1];
+      if (status === 'A' && !apActive) {
+        apActive = true;
+        apCurrentStart = tsStr || null;
+        apCurrentMode = 'track';
+      } else if (status !== 'A' && apActive) {
+        apActive = false;
+        if (apCurrentStart) apSegments.push({ start: apCurrentStart, end: tsStr || null, mode: apCurrentMode || 'track' });
+        apCurrentStart = null;
+      }
+    }
+
+    // ── DSC: Digital Selective Calling ──
+    if (st === 'DSC' && f.length >= 4) {
+      const mmsi = f[2] || '';
+      const catCode = f[3] || '';
+      const cat = DSC_CAT[catCode] || 'other';
+      const nature = (f.length >= 5 && DSC_NATURE[f[4]]) ? DSC_NATURE[f[4]] : null;
+      let dscPos = null;
+      for (let pi = 4; pi + 3 < f.length; pi++) {
+        if ((f[pi+1] === 'N' || f[pi+1] === 'S') && (f[pi+3] === 'E' || f[pi+3] === 'W')) {
+          dscPos = parseLatLon(f[pi], f[pi+1], f[pi+2], f[pi+3]);
+          if (dscPos) break;
+        }
+      }
+      const dsc = { mmsi, category: cat, nature, lat: dscPos ? dscPos.lat : null, lon: dscPos ? dscPos.lon : null, time: tsStr || null };
+      dscCalls.push(dsc);
+      if (cat !== 'routine') {
+        const detail = nature ? t('dscCallNature', cat.toUpperCase(), mmsi, nature) : t('dscCall', cat.toUpperCase(), mmsi);
+        events.push({ type: 'dsc', time: dsc.time, detail, lat: dsc.lat, lon: dsc.lon });
+      }
+    }
+  }
+
+  // ── Finalize ───────────────────────────────────────────────────
+
+  if (det.engine) det.engine.finalize(endTime);
+  const enginePeriods = det.engine ? det.engine.periods : [];
+  let engineHours = det.engine ? det.engine.totalHours() : 0;
+
+  // If runtime hour-meter (XDR RUNTIME) gave non-zero delta, it's more accurate
+  // than RPM-derived estimates. Use it as authoritative for the day's engine hours.
+  if (runtimeV.length > 1) {
+    const delta = runtimeV[runtimeV.length - 1].v - runtimeV[0].v;
+    if (delta > 0 && delta < 24) {
+      engineHours = delta;
+    }
+  }
+
+  // Fallback engine hours from RPM data (only if no periods detected and no runtime delta)
+  if (enginePeriods.length === 0) {
+    const rpmThr = config.evEngineRpmThreshold || 100;
+    for (let i = 1; i < rpmE.length; i++) {
+      if (rpmE[i].time && rpmE[i - 1].time && rpmE[i - 1].rpm > rpmThr) {
+        const dt = (rpmE[i].time - rpmE[i - 1].time) / 3600000;
+        if (dt > 0 && dt < 1) engineHours += dt;
+      }
+    }
+  }
+
+  // ── Fuel segments: motor vs sail distance ────────────────────
+  let fuelSegments = null;
+  if (totalDist > 0 && enginePeriods.length > 0) {
+    // Calculate distance covered during engine-on periods
+    let motorDist = 0;
+    for (const period of enginePeriods) {
+      if (!period.start || !period.end) continue;
+      const pStart = new Date(period.start).getTime();
+      const pEnd = new Date(period.end).getTime();
+      // Walk the track and sum distances within engine-on windows
+      for (let i = 1; i < track.length; i++) {
+        if (!track[i].time || !track[i - 1].time) continue;
+        const tTime = new Date(track[i].time).getTime();
+        const tPrev = new Date(track[i - 1].time).getTime();
+        if (tTime >= pStart && tPrev >= pStart && tTime <= pEnd) {
+          const d = haversineNm(track[i - 1].lat, track[i - 1].lon, track[i].lat, track[i].lon);
+          if (d < 10) motorDist += d;
+        }
+      }
+    }
+    const sailDist = Math.max(0, totalDist - motorDist);
+    const motorPct = Math.round(motorDist / totalDist * 100);
+    fuelSegments = {
+      motorDistNm: r2(motorDist),
+      sailDistNm: r2(sailDist),
+      motorPct,
+      motorHours: r2(engineHours)
+    };
+  }
+
+  // ── Post-processing: automatic event detection on collected data ──
+
+  /**
+   * Anchor detection: find segments where the boat stayed within a small radius
+   * for an extended period at very low speed. Emits 'anchor' events for the
+   * arrival point. Runs after main parsing on the collected track.
+   *
+   * Heuristic: SOG < 0.5kn for >= 30 minutes, drift radius < 50m.
+   */
+  function detectAnchorEvents() {
+    const ANCHOR_MIN_DURATION_MS = 30 * 60 * 1000; // 30 min
+    const ANCHOR_MAX_SOG = 0.5;                    // kn
+    const ANCHOR_MAX_DRIFT_NM = 50 / 1852;         // 50m in nm
+    if (track.length < 10) return;
+    let segStart = null, segCenter = null, segDriftMax = 0;
+    for (let i = 0; i < track.length; i++) {
+      const pt = track[i];
+      if (!pt.time) continue;
+      const sog = pt.sog;
+      const lowSog = (sog === null || sog === undefined || sog < ANCHOR_MAX_SOG);
+      if (lowSog && segStart === null) {
+        segStart = pt;
+        segCenter = { lat: pt.lat, lon: pt.lon };
+        segDriftMax = 0;
+      } else if (lowSog && segStart) {
+        // Track maximum drift from segment center
+        const drift = haversineNm(segCenter.lat, segCenter.lon, pt.lat, pt.lon);
+        if (drift > segDriftMax) segDriftMax = drift;
+        // If drift exceeds threshold, this isn't a stationary anchor — reset
+        if (segDriftMax > ANCHOR_MAX_DRIFT_NM) {
+          segStart = null; segCenter = null; segDriftMax = 0;
+        }
+      } else if (!lowSog && segStart) {
+        // End of low-SOG segment — check duration
+        const segEnd = pt;
+        const duration = new Date(segEnd.time).getTime() - new Date(segStart.time).getTime();
+        if (duration >= ANCHOR_MIN_DURATION_MS) {
+          const hours = Math.round(duration / 3600000 * 10) / 10;
+          events.push({
+            type: 'anchor',
+            time: segStart.time,
+            detail: t('anchorDropped', hours),
+            lat: segCenter.lat,
+            lon: segCenter.lon
+          });
+          // Also emit weigh-anchor at end of segment
+          events.push({
+            type: 'anchor',
+            time: segEnd.time,
+            detail: t('anchorWeighed'),
+            lat: segEnd.lat,
+            lon: segEnd.lon
+          });
+        }
+        segStart = null; segCenter = null; segDriftMax = 0;
+      }
+    }
+    // Handle still-anchored at end of log
+    if (segStart && track.length > 0) {
+      const lastPt = track[track.length - 1];
+      const duration = new Date(lastPt.time).getTime() - new Date(segStart.time).getTime();
+      if (duration >= ANCHOR_MIN_DURATION_MS) {
+        const hours = Math.round(duration / 3600000 * 10) / 10;
+        events.push({
+          type: 'anchor',
+          time: segStart.time,
+          detail: t('anchorDropped', hours),
+          lat: segCenter.lat,
+          lon: segCenter.lon
+        });
+      }
+    }
+  }
+
+  /**
+   * Harbor arrival/departure detection: match start and end positions of the day
+   * to a known harbor database. If start position is within 200m of a harbor,
+   * emit 'departure' event. If end position is within 200m of a harbor and
+   * boat stopped there for >5 min, emit 'arrival' event.
+   *
+   * The harbor list is provided via opts.harbors as [{name, lat, lon}, ...].
+   */
+  function detectHarborEvents() {
+    const HARBOR_RADIUS_NM = 200 / 1852; // 200m
+    const STOP_MIN_DURATION_MS = 5 * 60 * 1000;
+    const harbors = opts.harbors || [];
+    if (!harbors.length || track.length < 2) return;
+
+    function nearestHarbor(lat, lon) {
+      let best = null, bestDist = Infinity;
+      for (const h of harbors) {
+        const d = haversineNm(lat, lon, h.lat, h.lon);
+        if (d < bestDist) { bestDist = d; best = h; }
+      }
+      return (best && bestDist <= HARBOR_RADIUS_NM) ? { harbor: best, distance: bestDist } : null;
+    }
+
+    // Departure: first position with movement after a stationary start
+    const first = track[0];
+    const depHarbor = nearestHarbor(first.lat, first.lon);
+    if (depHarbor && first.time) {
+      events.push({
+        type: 'harbor',
+        time: first.time,
+        detail: t('harborDeparture', depHarbor.harbor.name),
+        lat: first.lat,
+        lon: first.lon
+      });
+    }
+
+    // Arrival: last position if near harbor, AND last few minutes show stopped state
+    const last = track[track.length - 1];
+    const arrHarbor = nearestHarbor(last.lat, last.lon);
+    if (arrHarbor && last.time) {
+      // Verify stopped for last 5+ minutes
+      let arrTime = last.time;
+      for (let i = track.length - 1; i >= 0; i--) {
+        const pt = track[i];
+        if (!pt.time) continue;
+        const distFromLast = haversineNm(pt.lat, pt.lon, last.lat, last.lon);
+        if (distFromLast < HARBOR_RADIUS_NM) arrTime = pt.time;
+        else break;
+      }
+      const stopMs = new Date(last.time).getTime() - new Date(arrTime).getTime();
+      if (stopMs >= STOP_MIN_DURATION_MS) {
+        events.push({
+          type: 'harbor',
+          time: arrTime,
+          detail: t('harborArrival', arrHarbor.harbor.name),
+          lat: last.lat,
+          lon: last.lon
+        });
+      }
+    }
+  }
+
+  /**
+   * Suspect sail reduction: detect SOG drops that don't correlate with wind change.
+   * If SOG drops by >30% over a short window while TWS stays roughly constant,
+   * the most likely cause is a sail change (reefing, dropping headsail).
+   *
+   * This is heuristic — not always correct — but flags moments worth reviewing.
+   */
+  function detectSailReductions() {
+    const WINDOW_PTS = 6;        // ~3 min at 30s sampling
+    const SOG_DROP_RATIO = 0.7;  // new SOG < 70% of old
+    const TWS_STABLE_PCT = 0.20; // wind change within 20%
+    const MIN_SOG = 2;           // skip if both speeds very low
+    if (track.length < WINDOW_PTS * 3 || twsV.length < 10) return;
+
+    // Build TWS-by-time lookup using interval buckets approximate
+    // For a simple implementation: get global TWS samples, walk track points and
+    // match by index ratio (good enough since both arrays are time-ordered).
+    const twsRatio = twsV.length / track.length;
+
+    let lastDetectionIdx = -WINDOW_PTS * 5;
+    for (let i = WINDOW_PTS * 2; i < track.length - WINDOW_PTS; i++) {
+      if (i - lastDetectionIdx < WINDOW_PTS * 3) continue; // throttle: max one per ~9 min
+      const pt = track[i];
+      if (!pt.time) continue;
+
+      // Average SOG before and after this point
+      let sogBefore = 0, cntBefore = 0;
+      for (let j = i - WINDOW_PTS * 2; j < i; j++) {
+        if (track[j].sog !== null && track[j].sog !== undefined) { sogBefore += track[j].sog; cntBefore++; }
+      }
+      let sogAfter = 0, cntAfter = 0;
+      for (let j = i; j < i + WINDOW_PTS; j++) {
+        if (track[j].sog !== null && track[j].sog !== undefined) { sogAfter += track[j].sog; cntAfter++; }
+      }
+      if (cntBefore < WINDOW_PTS / 2 || cntAfter < WINDOW_PTS / 2) continue;
+      sogBefore /= cntBefore; sogAfter /= cntAfter;
+
+      if (sogBefore < MIN_SOG || sogAfter < MIN_SOG) continue;
+      if (sogAfter / sogBefore > SOG_DROP_RATIO) continue;
+
+      // Wind stability check
+      const twsIdxBefore = Math.floor((i - WINDOW_PTS) * twsRatio);
+      const twsIdxAfter = Math.floor((i + WINDOW_PTS / 2) * twsRatio);
+      if (twsIdxBefore < 0 || twsIdxAfter >= twsV.length) continue;
+      const twsBefore = twsV[twsIdxBefore];
+      const twsAfter = twsV[twsIdxAfter];
+      if (twsBefore < 5) continue; // ignore light wind
+      if (Math.abs(twsAfter - twsBefore) / twsBefore > TWS_STABLE_PCT) continue;
+
+      // SOG dropped significantly while wind stable — likely sail change
+      events.push({
+        type: 'sailchange',
+        time: pt.time,
+        detail: t('sailReductionSuspect',
+          Math.round(twsBefore),
+          sogBefore.toFixed(1),
+          sogAfter.toFixed(1)),
+        lat: pt.lat,
+        lon: pt.lon
+      });
+      lastDetectionIdx = i;
+    }
+  }
+
+  // Run the detectors (each is a no-op if config disables it or data insufficient)
+  if (config.evAnchorEnabled !== false) detectAnchorEvents();
+  if (config.evHarborEnabled !== false) detectHarborEvents();
+  if (config.evSailChangeEnabled !== false) detectSailReductions();
+
+  // Downsample track for display using hybrid distance+time sampling.
+  // A point is accepted if:
+  //   (a) it is further than the distance threshold from the last accepted point
+  //       (preserves course changes and sailing track), OR
+  //   (b) more than 5 minutes have elapsed since the last accepted point
+  //       (guarantees temporal resolution at anchor/in marina for stability analysis)
+  // This ensures stationary periods show drift rather than collapsing to a single point.
+  const TIME_GUARANTEE_MS = 5 * 60 * 1000; // 5 minutes
+  let displayTrack = track;
+  if (!opts.fullTrack && track.length > TRACK_MAX_POINTS) {
+    let totDist = 0;
+    for (let i = 1; i < track.length; i++) {
+      totDist += haversineNm(track[i-1].lat, track[i-1].lon, track[i].lat, track[i].lon);
+    }
+    const threshold = totDist / TRACK_MAX_POINTS;
+    displayTrack = [track[0]];
+    let lastAccepted = track[0];
+    for (let i = 1; i < track.length - 1; i++) {
+      const pt = track[i];
+      const d = haversineNm(lastAccepted.lat, lastAccepted.lon, pt.lat, pt.lon);
+      const dt = (pt.time && lastAccepted.time)
+        ? new Date(pt.time).getTime() - new Date(lastAccepted.time).getTime()
+        : Infinity;
+      if (d >= threshold || dt >= TIME_GUARANTEE_MS) {
+        displayTrack.push(pt);
+        lastAccepted = pt;
+      }
+    }
+    // Always include last point
+    if (track.length > 1) displayTrack.push(track[track.length - 1]);
+  }
+
+  // Aggregate stats
+  // Average speed counts only "moving" samples (above threshold) — excludes
+  // periods at anchor or in harbor where SOG is near zero, which would otherwise
+  // skew the average downward and misrepresent the actual sailing performance.
+  const sogMovingThreshold = (config.movingSogThresholdKn !== undefined ? config.movingSogThresholdKn : 0.5);
+  const sogMoving = sogV.filter(v => v >= sogMovingThreshold);
+  const sogAvg = sogMoving.length ? sogMoving.reduce((a, b) => a + b, 0) / sogMoving.length : null;
+  const sogMax = sogV.length ? arrMax(sogV) : null;
+  const twsMax = twsV.length ? arrMax(twsV) : null;
+  const twsAvg = twsV.length ? twsV.reduce((a, b) => a + b, 0) / twsV.length : null;
+  const twaAvg = twaV.length ? twaV.reduce((a, b) => a + b, 0) / twaV.length : null;
+  const twaMin = twaV.length ? arrMin(twaV) : null;
+  const twaMax = twaV.length ? arrMax(twaV) : null;
+
+  const depthMin = depthV.length ? arrMin(depthV) : null;
+  const depthMax = depthV.length ? arrMax(depthV) : null;
+  const depthAvg = depthV.length ? depthV.reduce((a, b) => a + b, 0) / depthV.length : null;
+
+  if (apActive && apCurrentStart) {
+    apSegments.push({ start: apCurrentStart, end: endTime ? endTime.toISOString() : null, mode: apCurrentMode || 'track' });
+  }
+  const hdgAvg = hdgV.length ? r0(hdgV.reduce((a, b) => a + b, 0) / hdgV.length) : null;
+  const rsaAvg = rsaV.length ? r1(rsaV.reduce((a, b) => a + b, 0) / rsaV.length) : null;
+  const rsaMax = rsaV.length ? r1(arrMax(rsaV.map(Math.abs))) : null;
+  const xteAvg = xteV.length ? r2(xteV.reduce((a, b) => a + b, 0) / xteV.length) : null;
+  const xteMax = xteV.length ? r2(arrMax(xteV.map(Math.abs))) : null;
+
+  const weatherIntervals = Object.keys(intervalBuckets).sort((a, b) => a - b).map(bucket => {
+    const b = intervalBuckets[bucket];
+    return {
+      hour: parseInt(bucket, 10),
+      lat: Math.round((b.latSum / b.count) * 10000) / 10000,
+      lon: Math.round((b.lonSum / b.count) * 10000) / 10000,
+      measuredTWS: b.twsValues.length ? r1(b.twsValues.reduce((a, v) => a + v, 0) / b.twsValues.length) : null,
+      measuredTemp: b.tempValues.length ? r1(b.tempValues.reduce((a, v) => a + v, 0) / b.tempValues.length) : null
+    };
+  });
+
+  events.sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+
+  // Stride-based downsampling: pick SERIES_MAX evenly-spaced points
+  // so charts show the full trip regardless of total point count.
+  function downsample(arr) {
+    if (!arr || arr.length <= SERIES_MAX) return arr;
+    const step = arr.length / SERIES_MAX;
+    const out = [];
+    for (let i = 0; i < SERIES_MAX; i++) out.push(arr[Math.floor(i * step)]);
+    return out;
+  }
+
+  return {
+    track: displayTrack, totalDistanceNm: r2(totalDist),
+    startTime: startTime ? startTime.toISOString() : null,
+    endTime: endTime ? endTime.toISOString() : null,
+    durationHours: startTime && endTime ? r2((endTime - startTime) / 3600000) : null,
+    sogAvgKn: r2(sogAvg), sogMaxKn: r2(sogMax),
+    twsMaxKn: r2(twsMax), twsAvgKn: r2(twsAvg),
+    twaAvgDeg: r0(twaAvg), twaMinDeg: r0(twaMin), twaMaxDeg: r0(twaMax),
+    twaSamples: twaV.length,
+    engineHours: r2(engineHours), enginePeriods,
+    rpmSamples: rpmE.length, trackPoints: track.length,
+    vdoTrackPoints: track.filter(p => p.src === 'vdo').length,
+    // Chart series (timestamped, uniformly downsampled to SERIES_MAX points)
+    sogSeries: downsample(sogRaw), twsSeries: downsample(twsRaw), awsSeries: downsample(awsRaw),
+    twaSeries: downsample(twaRaw), awaSeries: downsample(awaRaw),
+    depthSeries: downsample(depthRaw), stwSeries: downsample(stwRaw),
+    // Engine sensor stats from ESP32 / external monitor via XDR sentences
+    engineTempMin: engineTempV.length ? r1(arrMin(engineTempV.map(x => x.v))) : null,
+    engineTempMax: engineTempV.length ? r1(arrMax(engineTempV.map(x => x.v))) : null,
+    engineTempAvg: engineTempV.length ? r1(engineTempV.reduce((a, b) => a + b.v, 0) / engineTempV.length) : null,
+    engineTempSamples: engineTempV.length,
+    fuelLevelStart: fuelLevelV.length ? r1(fuelLevelV[0].v) : null,
+    fuelLevelEnd: fuelLevelV.length ? r1(fuelLevelV[fuelLevelV.length - 1].v) : null,
+    fuelLevelMin: fuelLevelV.length ? r1(arrMin(fuelLevelV.map(x => x.v))) : null,
+    fuelLevelSamples: fuelLevelV.length,
+    runtimeStart: runtimeV.length ? r2(runtimeV[0].v) : null,
+    runtimeEnd: runtimeV.length ? r2(runtimeV[runtimeV.length - 1].v) : null,
+    runtimeDelta: runtimeV.length > 1 ? r2(runtimeV[runtimeV.length - 1].v - runtimeV[0].v) : null,
+    runtimeSamples: runtimeV.length,
+    sogSamples: sogV.length, twsSamples: twsV.length,
+    depthMinM: r1(depthMin), depthMaxM: r1(depthMax), depthAvgM: r1(depthAvg),
+    depthSamples: depthV.length,
+    shallowest: shallowest ? { depth: r1(shallowest.depth), lat: shallowest.lat, lon: shallowest.lon, time: shallowest.time } : null,
+    hdgSamples: hdgV.length, hdgAvgDeg: hdgAvg,
+    rsaSamples: rsaV.length, rsaAvgDeg: rsaAvg, rsaMaxDeg: rsaMax,
+    xteSamples: xteV.length, xteAvgNm: xteAvg, xteMaxNm: xteMax,
+    apSegments: apSegments.length ? apSegments : undefined,
+    dscCalls: dscCalls.length ? dscCalls : undefined,
+    ahConsumed: ahConsumed > 0 ? r2(ahConsumed) : null,
+    currentSamples: currentV.length,
+    socStart: socV.length ? socV[0] : null,
+    socEnd: socV.length ? socV[socV.length - 1] : null,
+    fuelSegments,
+    checksumFails,
+    events, weatherIntervals,
+    aisVessels: collectAIS ? aisVessels : undefined,
+    totalLines,
+    sentenceTypes: Object.keys(sentenceTypeCounts).sort(),
+    sentenceTypeCounts,
+    gpsQuality: gpsTotal > 0 ? {
+      total: gpsTotal, invalid: gpsInvalid,
+      pct: Math.round(gpsInvalid / gpsTotal * 1000) / 10,
+      status: (gpsInvalid / gpsTotal) <= 0.02 ? 'green' : (gpsInvalid / gpsTotal) <= 0.10 ? 'orange' : 'red'
+    } : null
+  };
+}
+
+module.exports = { parseLogFile, parseLogFileAsync, parseLatLon, parseDateTime, haversineNm, strip };

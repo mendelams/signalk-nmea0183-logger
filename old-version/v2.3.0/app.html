@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>NMEA0183 Logger</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+:root{
+  --bg:#1a1d23;--card:#22252b;--card2:#2a2d35;--border:#333;
+  --text:#e0e0e0;--muted:#888;--dim:#555;
+  --blue:#4fc3f7;--green:#66bb6a;--orange:#ff9800;--red:#ef5350;--purple:#ab47bc;--cyan:#26c6da;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden}
+.container{max-width:900px;margin:0 auto;padding:12px}
+
+/* ── Header ─────────────────────────────────────── */
+.header{display:flex;align-items:center;justify-content:space-between;padding:8px 0;margin-bottom:8px;flex-wrap:wrap;gap:6px}
+.header h1{font-size:1.1em;color:var(--blue);white-space:nowrap}
+.header-sub{color:var(--muted);font-size:.72em}
+.chips{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px}
+.chip{background:var(--card2);border:1px solid var(--border);border-radius:4px;padding:2px 7px;font-size:.7em;color:var(--muted)}
+.chip b{color:var(--blue);font-weight:600}
+
+/* ── Buttons ────────────────────────────────────── */
+.btn{display:inline-flex;align-items:center;gap:4px;padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:var(--text);font-size:.78em;cursor:pointer;text-decoration:none;white-space:nowrap;-webkit-tap-highlight-color:transparent}
+.btn:active{transform:scale(.97)}
+.btn-blue{border-color:var(--blue);color:var(--blue)}
+.btn-blue:active{background:var(--blue);color:var(--bg)}
+.btn-red{border-color:var(--red);color:var(--red)}
+.btn-green{border-color:var(--green);color:var(--green)}
+.btn-sm{padding:4px 8px;font-size:.72em}
+
+/* ── Top bar for detail view ────────────────────── */
+.topbar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;padding:6px 0;margin-bottom:6px}
+.topbar-left{display:flex;align-items:center;gap:8px}
+.back{color:var(--blue);font-size:.85em;cursor:pointer;text-decoration:none;padding:4px 0}
+.topbar-title{font-size:.9em;font-weight:600;color:var(--text)}
+.topbar-right{display:flex;gap:6px}
+
+/* ── Card (generic) ─────────────────────────────── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:10px;overflow:hidden}
+.card-title{background:var(--card2);padding:8px 12px;font-size:.8em;color:var(--muted);font-weight:600;letter-spacing:.3px;text-transform:uppercase}
+
+/* ── Map ────────────────────────────────────────── */
+#map{height:45vh;min-height:260px;max-height:500px;width:100%;background:var(--bg)}
+
+/* ── Stats tile ─────────────────────────────────── */
+.stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border)}
+.sg-item{background:var(--card);padding:10px 8px;text-align:center}
+.sg-label{font-size:.62em;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px;line-height:1.2}
+.sg-val{font-size:1.15em;font-weight:700;color:var(--blue);line-height:1.2}
+.sg-unit{font-size:.6em;color:var(--muted);margin-left:1px}
+.sg-section{grid-column:1/-1;background:var(--card2);padding:4px 10px;font-size:.62em;color:var(--dim);text-transform:uppercase;letter-spacing:.8px}
+
+/* ── Weather table ──────────────────────────────── */
+.wx-table{width:100%;border-collapse:collapse}
+.wx-table th{padding:6px 8px;text-align:left;font-size:.65em;color:var(--muted);text-transform:uppercase;letter-spacing:.3px;background:var(--card2);border-bottom:1px solid var(--border);position:sticky;top:0}
+.wx-table td{padding:7px 8px;font-size:.8em;border-bottom:1px solid #2a2d35}
+.wx-table tr:last-child td{border-bottom:none}
+.wx-table tr:active{background:var(--card2)}
+.wx-icon{font-size:1.2em;vertical-align:middle;margin-right:2px}
+.wx-temp{color:var(--orange);font-weight:600}
+.wx-wind{color:var(--purple)}
+.wx-gust{color:var(--red);font-size:.82em}
+.wx-cloud{color:#90a4ae}
+.wx-desc{color:var(--muted);font-size:.78em}
+.wx-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.wx-note{padding:6px 10px;font-size:.65em;color:var(--dim);font-style:italic}
+.wx-loading{padding:16px;text-align:center;color:var(--dim);font-size:.82em}
+
+/* ── NMEA log viewer ────────────────────────────── */
+.nmea-toolbar{display:flex;gap:6px;padding:8px 10px;flex-wrap:wrap;align-items:center;background:var(--card2)}
+.nmea-toolbar input,.nmea-toolbar select{background:var(--bg);border:1px solid var(--border);border-radius:5px;color:var(--text);padding:5px 8px;font-size:.8em;flex:1;min-width:0}
+.nmea-toolbar select{flex:0 0 auto;width:auto}
+.nmea-toolbar input:focus,.nmea-toolbar select:focus{outline:none;border-color:var(--blue)}
+.nmea-info{padding:4px 10px;font-size:.7em;color:var(--muted)}
+.log-view{background:#111318;padding:8px 10px;max-height:50vh;overflow:auto;font-family:'Fira Code',Consolas,monospace;font-size:.7em;line-height:1.55;white-space:pre;-webkit-overflow-scrolling:touch}
+.ll{color:#bbb}.ts{color:#555}.ais{color:var(--orange)}.gps{color:var(--green)}.depth{color:#42a5f5}.wind{color:var(--purple)}.hdg{color:var(--cyan)}
+
+/* ── File list table ────────────────────────────── */
+.ftable{width:100%;border-collapse:collapse}
+.ftable th{text-align:left;padding:8px 10px;font-size:.68em;color:var(--muted);text-transform:uppercase;background:var(--card2);border-bottom:1px solid var(--border)}
+.ftable td{padding:8px 10px;font-size:.82em;border-bottom:1px solid #2a2d35}
+.ftable tr:active{background:var(--card2)}
+.flink{color:var(--blue);text-decoration:none;cursor:pointer}
+.fsize{color:var(--muted)}
+.live{background:var(--green);color:var(--bg);font-size:.62em;padding:1px 6px;border-radius:8px;font-weight:700;margin-left:4px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+
+.empty{text-align:center;padding:30px;color:var(--dim)}
+.loading{text-align:center;padding:20px;color:var(--dim)}
+
+/* ── Responsive ─────────────────────────────────── */
+@media(max-width:480px){
+  .container{padding:8px}
+  .stats-grid{grid-template-columns:repeat(2,1fr)}
+  .topbar-title{font-size:.8em}
+  #map{height:38vh;min-height:220px}
+  .log-view{font-size:.65em;max-height:40vh}
+  .ftable td,.ftable th{padding:6px 8px;font-size:.78em}
+  .wx-table td,.wx-table th{padding:5px 6px;font-size:.75em}
+}
+@media(min-width:600px){
+  .stats-grid{grid-template-columns:repeat(4,1fr)}
+}
+@media(min-width:768px){
+  .stats-grid{grid-template-columns:repeat(6,1fr)}
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div><h1>NMEA0183 Logger</h1><div class="header-sub" id="logdir"></div></div>
+  </div>
+  <div class="chips" id="chips"></div>
+  <div id="app"></div>
+</div>
+
+<script>
+const API_SK = `http://${window.location.hostname}:3000/plugins/signalk-nmea0183-logger`;
+let autoRefresh=null,leafletMap=null;
+
+async function api(e){
+  const r=await fetch(e);
+  if(!r.ok){const t=await r.text().catch(()=>'');throw new Error(`${r.status}: ${t.substring(0,120)}`);}
+  const ct=r.headers.get('content-type')||'';
+  if(!ct.includes('json')&&!ct.includes('octet')){const t=await r.text().catch(()=>'');throw new Error('Geen JSON: '+t.substring(0,100));}
+  return r.json();
+}
+const fmtSize=b=>b<1024?b+' B':b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(1)+' MB';
+const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const fmtTime=iso=>{if(!iso)return'—';const d=new Date(iso);return d.toLocaleDateString('nl-NL')+' '+d.toLocaleTimeString('nl-NL',{hour:'2-digit',minute:'2-digit'});};
+const fmtHM=iso=>{if(!iso)return'—';return new Date(iso).toLocaleTimeString('nl-NL',{hour:'2-digit',minute:'2-digit'});};
+function fmtDur(h){if(h===null||h===undefined)return'—';const hr=Math.floor(h),m=Math.round((h-hr)*60);return hr+'u\u2009'+(m<10?'0':'')+m+'m';}
+function v(x,u){return(x!==null&&x!==undefined)?x+(u||''):'—';}
+
+const WMO={0:['☀️','Onbewolkt'],1:['🌤','Licht bewolkt'],2:['⛅','Half bewolkt'],3:['☁️','Bewolkt'],
+  45:['🌫','Mist'],48:['🌫','Rijpmist'],51:['🌦','Lichte motregen'],53:['🌧','Motregen'],
+  55:['🌧','Zware motregen'],56:['🌧','Aanvr. motregen'],57:['🌧','Zware aanvr. motregen'],
+  61:['🌧','Lichte regen'],63:['🌧','Regen'],65:['🌧','Zware regen'],
+  66:['🌧','Aanvr. regen'],67:['🌧','Zware aanvr. regen'],
+  71:['🌨','Lichte sneeuw'],73:['🌨','Sneeuw'],75:['🌨','Zware sneeuw'],77:['🌨','Sneeuwkorrels'],
+  80:['🌦','Lichte buien'],81:['🌧','Buien'],82:['⛈','Zware buien'],
+  85:['🌨','Sneeuwbuien'],86:['🌨','Zware sneeuwbuien'],
+  95:['⛈','Onweer'],96:['⛈','Onweer+hagel'],99:['⛈','Zwaar onweer']};
+function wmo(c){return WMO[c]||['❓','Code '+c];}
+
+function colorize(l){
+  let h=esc(l);
+  h=h.replace(/^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)/,'<span class="ts">$1</span>');
+  if(/AIVDM|AIVDO/.test(l))return h.replace(/(![A-Z]{5})/,'<span class="ais">$1</span>');
+  if(/\$..(?:GGA|RMC|GLL|VTG)/.test(l))return h.replace(/(\$[A-Z]{5})/,'<span class="gps">$1</span>');
+  if(/\$..DB[TKS]|\$..DPT/.test(l))return h.replace(/(\$[A-Z]{5})/,'<span class="depth">$1</span>');
+  if(/\$..(?:MWV|MWD|VWR)/.test(l))return h.replace(/(\$[A-Z]{5})/,'<span class="wind">$1</span>');
+  if(/\$..HD[GMT]/.test(l))return h.replace(/(\$[A-Z]{5})/,'<span class="hdg">$1</span>');
+  return h;
+}
+
+async function loadChips(){
+  try{
+    const s=await api('/api/stats');
+    document.getElementById('logdir').textContent=s.logDirectory||'';
+    const el=document.getElementById('chips');
+    const e=Object.entries(s.sentenceStats||{}).sort((a,b)=>b[1]-a[1]);
+    el.innerHTML=e.length?e.map(([t,c])=>`<span class="chip">${t} <b>${c.toLocaleString()}</b></span>`).join('')
+      :'<span class="chip">Wacht op data…</span>';
+  }catch(e){console.error(e);}
+}
+
+/* ════════════════════════════════════════════════════
+   FILE LIST
+   ════════════════════════════════════════════════════ */
+async function showList(){
+  stopAuto();destroyMap();
+  const el=document.getElementById('app');
+  el.innerHTML='<div class="loading">Laden…</div>';
+  try{
+    const files=await api('/api/logs');
+    if(!files.length){el.innerHTML='<div class="card"><div class="empty">Nog geen logbestanden.</div></div>';return;}
+    const today=new Date().toISOString().split('T')[0];
+    let h='<div class="card"><table class="ftable"><tr><th>Datum</th><th>Grootte</th><th></th></tr>';
+    for(const f of files){
+      const isToday=f.date===today;
+      h+=`<tr><td><a class="flink" onclick="viewFile('${f.name}')">${f.date}</a>${isToday?'<span class="live">LIVE</span>':''}</td>`;
+      h+=`<td class="fsize">${fmtSize(f.size)}</td>`;
+      h+=`<td style="text-align:right"><span class="btn btn-blue btn-sm" onclick="viewFile('${f.name}')">Bekijk</span></td></tr>`;
+    }
+    h+='</table></div>';
+    el.innerHTML=h;
+  }catch(e){el.innerHTML=`<div class="card"><div class="empty">Fout: ${esc(e.message)}</div></div>`;}
+}
+
+/* ════════════════════════════════════════════════════
+   DETAIL VIEW
+   ════════════════════════════════════════════════════ */
+async function viewFile(fn){
+  stopAuto();destroyMap();
+  const el=document.getElementById('app');
+  el.innerHTML='<div class="loading">Analyseren…</div>';
+
+  const [stats,logData]=await Promise.all([
+    api('/api/logs/'+fn+'/stats').catch(()=>null),
+    api('/api/logs/'+fn+'?lines=200').catch(()=>null)
+  ]);
+
+  let h='';
+
+  /* ── Top bar ── */
+  h+=`<div class="topbar">
+    <div class="topbar-left"><a class="back" onclick="showList()">← Terug</a><span class="topbar-title">${stats?stats.filename.replace('nmea0183_','').replace('.log',''):fn}</span></div>
+    <div class="topbar-right">
+      <a class="btn btn-sm" href="/api/logs/${fn}/download">⬇ Download</a>
+      <span class="btn btn-sm btn-red" onclick="delFile('${fn}')">🗑 Verwijder</span>
+    </div>
+  </div>`;
+
+  /* ── Map ── */
+  if(stats&&stats.track&&stats.track.length>0){
+    h+='<div class="card"><div id="map"></div></div>';
+  } else {
+    h+='<div class="card"><div class="empty">Geen GPS-track (RMC sentences nodig)</div></div>';
+  }
+
+  /* ── Stats tile ── */
+  if(stats){
+    h+='<div class="card"><div class="stats-grid">';
+
+    h+=sgSec('Navigatie');
+    h+=sg('Afstand',stats.totalDistanceNm,'nm');
+    h+=sg('Duur',fmtDur(stats.durationHours),'');
+    h+=sg('SOG gem.',stats.sogAvgKn,'kn');
+    h+=sg('SOG max',stats.sogMaxKn,'kn');
+    h+=sg('Begin',fmtHM(stats.startTime),'');
+    h+=sg('Einde',fmtHM(stats.endTime),'');
+
+    h+=sgSec('Wind');
+    h+=sg('TWS gem.',stats.twsAvgKn,'kn');
+    h+=sg('TWS max',stats.twsMaxKn,'kn');
+    h+=sg('TWA gem.',stats.twaAvgDeg,'°');
+    h+=sg('TWA min',stats.twaMinDeg,'°');
+    h+=sg('TWA max',stats.twaMaxDeg,'°');
+
+    h+=sgSec('Motor');
+    h+=sg('Uren',stats.engineHours>0?fmtDur(stats.engineHours):'—','');
+    h+=sg('RPM data',stats.rpmSamples,'');
+
+    h+='</div></div>';
+  }
+
+  /* ── Weather placeholder ── */
+  h+='<div id="wx-panel"></div>';
+
+  /* ── NMEA data ── */
+  h+=`<div class="card">
+    <div class="nmea-toolbar">
+      <input type="text" id="fi" placeholder="Filter (bv. RMC, VDM)" enterkeyhint="search"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();applyF('${fn}')}">
+      <select id="ln" onchange="applyF('${fn}')">
+        <option value="100">100</option><option value="200" selected>200</option>
+        <option value="500">500</option><option value="1000">1000</option><option value="0">Alles</option>
+      </select>
+      <span class="btn btn-sm btn-blue" onclick="applyF('${fn}')">Filter</span>
+      <span class="btn btn-sm" id="ar-btn" onclick="toggleAuto('${fn}')">Auto ✕</span>
+    </div>
+    <div class="nmea-info" id="log-info"></div>
+    <div class="log-view" id="log-content"></div>
+  </div>`;
+
+  el.innerHTML=h;
+
+  /* Render map */
+  if(stats&&stats.track&&stats.track.length>0) renderMap(stats.track);
+
+  /* Render log */
+  if(logData) renderLog(logData);
+
+  /* Fetch weather per interval position */
+  if(stats&&stats.weatherIntervals&&stats.weatherIntervals.length>0&&stats.startTime){
+    fetchIntervalWeather(stats.weatherIntervals, stats.startTime.split('T')[0]);
+  }
+}
+
+function sg(label,val,unit){
+  const display=(val!==null&&val!==undefined)?val:'—';
+  return `<div class="sg-item"><div class="sg-label">${label}</div><div class="sg-val">${display}${unit?'<span class="sg-unit">'+unit+'</span>':''}</div></div>`;
+}
+function sgSec(title){return `<div class="sg-section">${title}</div>`;}
+
+/* ════════════════════════════════════════════════════
+   WEATHER — per 2h interval with individual positions
+   ════════════════════════════════════════════════════ */
+async function fetchIntervalWeather(intervals, dateStr){
+  const panel=document.getElementById('wx-panel');
+  if(!panel)return;
+  panel.innerHTML='<div class="card"><div class="wx-loading">Weer ophalen…</div></div>';
+
+  const today=new Date().toISOString().split('T')[0];
+  const isHist=dateStr<today;
+
+  // Dedupe lat/lon: group intervals that share ~same position to reduce API calls
+  const groups=[];
+  for(const iv of intervals){
+    const existing=groups.find(g=>Math.abs(g.lat-iv.lat)<0.05&&Math.abs(g.lon-iv.lon)<0.05);
+    if(existing){existing.hours.push(iv.hour);}
+    else{groups.push({lat:iv.lat,lon:iv.lon,hours:[iv.hour]});}
+  }
+
+  // Fetch weather for each unique position
+  const results={}; // hour → { temp, cloud, code, wind, gust, humidity, lat, lon }
+  try{
+    const fetches=groups.map(async g=>{
+      const base=isHist?'https://archive-api.open-meteo.com/v1/archive':'https://api.open-meteo.com/v1/forecast';
+      const url=`${base}?latitude=${g.lat}&longitude=${g.lon}`+
+        `&start_date=${dateStr}&end_date=${dateStr}`+
+        `&hourly=temperature_2m,cloud_cover,weather_code,wind_speed_10m,wind_gusts_10m,relative_humidity_2m`+
+        `&wind_speed_unit=kn&timezone=UTC`;
+      const res=await fetch(url);
+      if(!res.ok)return;
+      const data=await res.json();
+      if(!data.hourly||!data.hourly.time)return;
+      const hr=data.hourly;
+      for(const hour of g.hours){
+        // Find the index for this hour in the hourly data
+        // Open-Meteo returns 24 hourly entries (0-23), we want the middle of the 2h window
+        const idx=hour+1; // e.g. bucket 8 → take hour 9 as representative
+        const safeIdx=Math.min(idx,hr.time.length-1);
+        results[hour]={
+          temp:hr.temperature_2m?hr.temperature_2m[safeIdx]:null,
+          cloud:hr.cloud_cover?hr.cloud_cover[safeIdx]:null,
+          code:hr.weather_code?hr.weather_code[safeIdx]:null,
+          wind:hr.wind_speed_10m?hr.wind_speed_10m[safeIdx]:null,
+          gust:hr.wind_gusts_10m?hr.wind_gusts_10m[safeIdx]:null,
+          humidity:hr.relative_humidity_2m?hr.relative_humidity_2m[safeIdx]:null,
+          lat:g.lat,lon:g.lon
+        };
+      }
+    });
+    await Promise.all(fetches);
+  }catch(e){console.error('Weather fetch error:',e);}
+
+  const sortedHours=Object.keys(results).map(Number).sort((a,b)=>a-b);
+  if(!sortedHours.length){panel.innerHTML='<div class="card"><div class="empty">Geen weerdata beschikbaar</div></div>';return;}
+
+  let html='<div class="card"><div class="card-title">Weer per 2-uurs interval</div><div class="wx-scroll"><table class="wx-table">';
+  html+='<tr><th>Tijd</th><th></th><th>Weer</th><th>Temp</th><th>Wind</th><th>Vlagen</th><th>Bewolking</th></tr>';
+
+  for(const hour of sortedHours){
+    const w=results[hour];
+    const [icon,desc]=wmo(w.code);
+    const timeLabel=String(hour).padStart(2,'0')+':00–'+String(hour+2).padStart(2,'0')+':00';
+    html+=`<tr>
+      <td style="white-space:nowrap">${timeLabel}</td>
+      <td><span class="wx-icon">${icon}</span></td>
+      <td><span class="wx-desc">${desc}</span></td>
+      <td class="wx-temp">${w.temp!==null?w.temp.toFixed(1)+'°':'—'}</td>
+      <td class="wx-wind">${w.wind!==null?Math.round(w.wind)+' kn':'—'}</td>
+      <td class="wx-gust">${w.gust!==null&&w.gust>0?Math.round(w.gust)+' kn':'—'}</td>
+      <td class="wx-cloud">${w.cloud!==null?w.cloud+'%':'—'}</td>
+    </tr>`;
+  }
+  html+='</table></div>';
+  html+=`<div class="wx-note">Bron: Open-Meteo.com — per interval op gemiddelde GPS-positie, wind in knopen</div></div>`;
+  panel.innerHTML=html;
+}
+
+/* ════════════════════════════════════════════════════
+   LEAFLET MAP
+   ════════════════════════════════════════════════════ */
+function destroyMap(){if(leafletMap){leafletMap.remove();leafletMap=null;}}
+
+function renderMap(track){
+  leafletMap=L.map('map',{zoomControl:true,attributionControl:false});
+  L.control.attribution({prefix:false,position:'bottomright'}).addTo(leafletMap);
+
+  const osm=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+    attribution:'© OSM',maxZoom:18}).addTo(leafletMap);
+  const sea=L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png',{
+    maxZoom:18,opacity:.8}).addTo(leafletMap);
+
+  const coords=track.map(p=>[p.lat,p.lon]);
+  const poly=L.polyline(coords,{color:var_blue(),weight:3,opacity:.85}).addTo(leafletMap);
+
+  // SOG gradient overlay
+  const sogPts=track.filter(p=>p.sog!==null);
+  if(sogPts.length>10){
+    const mx=Math.max(...sogPts.map(p=>p.sog),1);
+    for(let i=1;i<coords.length;i++){
+      const sog=track[i].sog;
+      if(sog!==null){
+        const r=Math.min(sog/mx,1);
+        L.polyline([coords[i-1],coords[i]],{
+          color:`rgb(${0|79+r*176},${0|195-r*112},${0|247-r*167})`,weight:3,opacity:.85
+        }).addTo(leafletMap);
+      }
+    }
+  }
+
+  // Markers
+  L.circleMarker(coords[0],{radius:7,color:'#66bb6a',fillColor:'#66bb6a',fillOpacity:1,weight:0})
+    .bindPopup(`<b>Start</b><br>${fmtTime(track[0].time)}`).addTo(leafletMap);
+  const end=coords[coords.length-1];
+  L.circleMarker(end,{radius:7,color:'#ef5350',fillColor:'#ef5350',fillOpacity:1,weight:0})
+    .bindPopup(`<b>Einde</b><br>${fmtTime(track[track.length-1].time)}`).addTo(leafletMap);
+
+  L.control.layers({'Kaart':osm},{'Zeekaart':sea},{collapsed:true}).addTo(leafletMap);
+  leafletMap.fitBounds(poly.getBounds().pad(.1));
+}
+function var_blue(){return'#4fc3f7';}
+
+/* ════════════════════════════════════════════════════
+   LOG VIEWER
+   ════════════════════════════════════════════════════ */
+function renderLog(data){
+  const info=document.getElementById('log-info');
+  const box=document.getElementById('log-content');
+  if(!data){box.innerHTML='<div class="empty">Fout bij laden.</div>';return;}
+  info.textContent=`${data.returnedLines.toLocaleString()} van ${data.totalLines.toLocaleString()} regels`+(data.filter?` (filter: ${data.filter})`:'');
+  if(!data.lines.length){box.innerHTML='<div class="empty">Geen resultaten.</div>';return;}
+  box.innerHTML=data.lines.map(l=>'<div class="ll">'+colorize(l)+'</div>').join('');
+  box.scrollTop=box.scrollHeight;
+}
+
+async function applyF(fn){
+  const filter=document.getElementById('fi').value;
+  const lines=parseInt(document.getElementById('ln').value)||0;
+  try{
+    let u='/api/logs/'+fn+'?lines='+lines;
+    if(filter)u+='&filter='+encodeURIComponent(filter);
+    renderLog(await api(u));
+  }catch(e){console.error(e);}
+}
+
+function toggleAuto(fn){
+  const btn=document.getElementById('ar-btn');
+  if(autoRefresh){stopAuto();btn.textContent='Auto ✕';btn.classList.remove('btn-green');}
+  else{btn.textContent='Auto ✓';btn.classList.add('btn-green');
+    autoRefresh=setInterval(()=>{applyF(fn);loadChips();},3000);}
+}
+function stopAuto(){if(autoRefresh){clearInterval(autoRefresh);autoRefresh=null;}}
+
+async function delFile(fn){
+  if(!confirm('Verwijder '+fn+'?'))return;
+  try{
+    const r=await fetch(API_SK+'/api/logs/'+fn,{method:'DELETE',credentials:'include'});
+    if(r.status===401||r.status===403){alert('Je moet ingelogd zijn in SignalK om bestanden te verwijderen.\n\nGa naar de SignalK admin UI en log eerst in.');return;}
+    if(!r.ok){const t=await r.text().catch(()=>'');alert('Fout: '+r.status+' '+t.substring(0,100));return;}
+    showList();
+  }catch(e){alert('Fout: '+e.message);}
+}
+
+/* ── Init ── */
+loadChips();showList();setInterval(loadChips,15000);
+</script>
+</body>
+</html>

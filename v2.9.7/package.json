@@ -1,0 +1,40 @@
+{
+  "name": "signalk-nmea0183-logger",
+  "version": "2.9.7",
+  "description": "NMEA0183 logger with GPS track, events, AIS, DSC, weather, engine/fuel/maintenance, and electrical monitoring for SignalK",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "nmea0183",
+    "logger",
+    "sailing",
+    "gps",
+    "ais",
+    "dsc",
+    "marine"
+  ],
+  "author": "TinkerSailor",
+  "license": "MIT",
+  "main": "index.js",
+  "signalk-plugin-enabled-by-default": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TinkerSailor/signalk-nmea0183-logger"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "public/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "signalk-webapp": {
+    "name": "NMEA0183 Logger",
+    "description": "Sailing logbook \u2014 GPS track, events, engine, weather",
+    "icon": "/plugins/signalk-nmea0183-logger/icon.svg",
+    "startUrl": "http://openplotter.local:3033/",
+    "displayType": "textual"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "signalk-nmea0183-logger",
+  "version": "2.8.0",
+  "description": "NMEA0183 voyage logger with GPS track on OpenSeaMap, events, weather, sea state, AIS, GPX and CSV export",
+  "main": "index.js",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-webapp",
+    "signalk-category-nmea-0183",
+    "signalk-category-ais",
+    "signalk-category-utility"
+  ],
+  "signalk-plugin-enabled-by-default": false,
+  "signalk": {
+    "displayName": "NMEA0183 Logger",
+    "appIcon": "/plugins/signalk-nmea0183-logger/public/icon.svg"
+  },
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "bugs": {
+    "url": ""
+  },
+  "author": "",
+  "license": "MIT"
+}
