@@ -1,6 +1,6 @@
 {
   "name": "signalk-nmea0183-logger",
-  "version": "2.9.7",
+  "version": "2.9.8",
   "description": "NMEA0183 logger with GPS track, events, AIS, DSC, weather, engine/fuel/maintenance, and electrical monitoring for SignalK",
   "keywords": [
     "signalk-node-server-plugin",
