@@ -2497,6 +2497,13 @@ module.exports = function (app) {
             dayStats.push(st);
           }
 
+          // Sort by actual log date so startTime/endTime/perDay are chronological
+          dayStats.sort((a, b) => {
+            const ta = a.startTime || a.logDate || '';
+            const tb = b.startTime || b.logDate || '';
+            return ta.localeCompare(tb);
+          });
+
           // Build combined stats
           const combined = {
             id: voyage.id,
@@ -2511,8 +2518,8 @@ module.exports = function (app) {
             totalDistanceNm: Math.round(dayStats.reduce((s, d) => s + (d.totalDistanceNm || 0), 0) * 100) / 100,
             totalEngineHours: Math.round(dayStats.reduce((s, d) => s + (d.engineHours || 0), 0) * 100) / 100,
             totalEnginePeriods: dayStats.reduce((s, d) => s + (d.enginePeriods ? d.enginePeriods.length : 0), 0),
-            startTime: dayStats.length ? dayStats[0].startTime : null,
-            endTime: dayStats.length ? dayStats[dayStats.length - 1].endTime : null,
+            startTime: dayStats.reduce((m, d) => !m || (d.startTime && d.startTime < m) ? d.startTime : m, null),
+            endTime: dayStats.reduce((m, d) => !m || (d.endTime && d.endTime > m) ? d.endTime : m, null),
             durationHours: null,
             // Averages & maxes across all days
             sogAvgKn: null, sogMaxKn: null, twsAvgKn: null, twsMaxKn: null,
